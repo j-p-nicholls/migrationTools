@@ -1,0 +1,150 @@
+# =============================================================================
+# .gitignore — Azure Migration / data-integrity validation project
+# =============================================================================
+# Scripts here run on Windows Server; development happens on macOS — so both
+# OS families are covered below.
+# -----------------------------------------------------------------------------
+# Validation outputs  ***DO NOT COMMIT***
+# -----------------------------------------------------------------------------
+# Manifests and comparison reports list the FULL PATHS of migrated files
+# (sensitive historical records). They are run artifacts, can be multi-GB, and
+# must never land in version control. Keep them out by name pattern wherever
+# they are written.
+manifest_*.csv
+manifest_*.summary.txt
+manifest_*.skipped.txt
+comparison_full_*.csv
+comparison_failures_*.csv
+comparison_summary_*.txt
+robocopy_compare_*.txt
+# Any stray sidecar from the capture engine
+*.summary.txt
+*.skipped.txt
+# Common output folders operators point -OutputPath at
+manifests/
+comparison/
+comparisons/
+output/
+out/
+results/
+# Belt-and-suspenders: uncomment to ignore ALL CSVs (this repo has no source CSVs)
+# *.csv
+# -----------------------------------------------------------------------------
+# Logs
+# -----------------------------------------------------------------------------
+*.log
+logs/
+# -----------------------------------------------------------------------------
+# Archives / exports (e.g. the old co-work.zip hand-off bundle)
+# -----------------------------------------------------------------------------
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+# -----------------------------------------------------------------------------
+# Secrets & credentials (Azure)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+secrets.json
+*.secret
+*.secrets
+*.publishsettings
+.azure/
+azureProfile.json
+accessTokens.json
+*.azureauth
+# Private keys / certificates — never commit these
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+*.crt
+# -----------------------------------------------------------------------------
+# PowerShell
+# -----------------------------------------------------------------------------
+# Transcripts
+PowerShell_transcript.*
+# Pester / test + coverage output
+testResults*.xml
+Pester*.xml
+*.TestResults.xml
+coverage*.xml
+*.coverage
+# Local PSScriptAnalyzer / module staging
+.psscriptanalyzer/
+*.psproj.user
+# -----------------------------------------------------------------------------
+# Temp & backup files
+# -----------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*~
+# Office lock files
+~$*
+# -----------------------------------------------------------------------------
+# macOS
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+Icon[\r]
+# -----------------------------------------------------------------------------
+# Windows
+# -----------------------------------------------------------------------------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+# -----------------------------------------------------------------------------
+# Linux
+# -----------------------------------------------------------------------------
+.directory
+.Trash-*
+.nfs*
+# -----------------------------------------------------------------------------
+# Editors / IDEs
+# -----------------------------------------------------------------------------
+# VS
+.vs/
+# VS Code
+.vscode/
+*.code-workspace
+# JetBrains
+.idea/
+*.iml
+# Vim
+*.swp
+*.swo
+*.swn
+Session.vim
+.netrwhist
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+# Emacs
+\#*\#
+.\#*
+# -----------------------------------------------------------------------------
+# Claude Code
+# -----------------------------------------------------------------------------
+# Machine-local settings (shared .claude/settings.json may still be committed)
+.claude/settings.local.json
