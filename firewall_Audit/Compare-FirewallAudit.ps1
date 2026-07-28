@@ -2,8 +2,11 @@
 <#
 .SYNOPSIS
     Compares firewall audit JSON files produced by Invoke-FirewallAudit.ps1.
-    Any two or all three phase files can be supplied — only the diffs possible
+    Any two or all three phase files can be supplied - only the diffs possible
     with the provided inputs are run.
+
+    Includes ASG membership diff, ASG-scoped NSG rule diff, and ASG-aware
+    IP Flow Verify comparison.
 
 .PARAMETER PreMigrationFile
     Path to the JSON output from the pre-migration (VMware) run.
@@ -25,22 +28,10 @@
         -MigratedFile     ".\AzureMigrated_SERVER01_20240101-110000.json"
 
 .EXAMPLE
-    # Reference vs Migrated only (no pre-migration file)
+    # Reference vs Migrated only
     .\Compare-FirewallAudit.ps1 `
         -ReferenceFile ".\AzureReference_REFVM_20240101-100000.json" `
         -MigratedFile  ".\AzureMigrated_SERVER01_20240101-110000.json"
-
-.EXAMPLE
-    # Pre-Migration vs Migrated only (no reference VM)
-    .\Compare-FirewallAudit.ps1 `
-        -PreMigrationFile ".\PreMigration_SERVER01_20240101-090000.json" `
-        -MigratedFile     ".\AzureMigrated_SERVER01_20240101-110000.json"
-
-.EXAMPLE
-    # Pre-Migration vs Reference only (planning / pre-cutover review)
-    .\Compare-FirewallAudit.ps1 `
-        -PreMigrationFile ".\PreMigration_SERVER01_20240101-090000.json" `
-        -ReferenceFile    ".\AzureReference_REFVM_20240101-100000.json"
 #>
 param(
     [string] $PreMigrationFile,
@@ -52,7 +43,7 @@ param(
 $ErrorActionPreference = "Continue"
 
 # ---------------------------------------------------------------------------
-# Validate — at least two files must be supplied
+# Validate - at least two files must be supplied
 # ---------------------------------------------------------------------------
 $suppliedCount = @($PreMigrationFile, $ReferenceFile, $MigratedFile) |
     Where-Object { $_ -ne '' -and $null -ne $_ } |
@@ -88,9 +79,17 @@ function Get-RuleKey {
     return "$($Rule.DisplayName)|$($Rule.Enabled)|$($Rule.Action)|$($Rule.Profile)|$($Rule.Protocol)|$($Rule.LocalPort)|$($Rule.RemoteAddress)"
 }
 
-function Get-NsgKey {
+function Get-NsgEffectiveKey {
     param($r)
     return "$($r.Priority)|$($r.Access)|$($r.Protocol)|$($r.SourceAddressPrefix)|$($r.SourcePortRange)|$($r.DestinationPortRange)"
+}
+
+# Raw NSG rule key preserves ASG names rather than resolved IPs
+function Get-NsgRawKey {
+    param($r)
+    $src = if ($r.SourceASGs) { "ASG:$($r.SourceASGs)" } else { $r.SourceAddressPrefix }
+    $dst = if ($r.DestinationASGs) { "ASG:$($r.DestinationASGs)" } else { $r.DestinationAddressPrefix }
+    return "$($r.Priority)|$($r.Access)|$($r.Protocol)|$src|$($r.SourcePortRange)|$dst|$($r.DestinationPortRange)"
 }
 
 $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -118,23 +117,36 @@ function Add-Finding {
     if ($Detail) { Write-Host "         $Detail" -ForegroundColor DarkGray }
 }
 
-# Helper: run a firewall rule diff between two named datasets
+# ---------------------------------------------------------------------------
+# Comparison helpers
+# ---------------------------------------------------------------------------
+
+function Test-FirewallProfiles {
+    param([string]$Label, $Data)
+    foreach ($cp in $Data.ConnectionProfiles) {
+        if ($cp.NetworkCategory -ne 'DomainAuthenticated') {
+            Add-Finding -Category "FirewallProfile" -Severity "FAIL" `
+                -Description "$Label : Interface '$($cp.InterfaceAlias)' on '$($cp.NetworkCategory)' - expected DomainAuthenticated" `
+                -Detail "The wrong firewall rule set will apply."
+        } else {
+            Add-Finding -Category "FirewallProfile" -Severity "PASS" `
+                -Description "$Label : Interface '$($cp.InterfaceAlias)' correctly on DomainAuthenticated"
+        }
+    }
+}
+
 function Compare-FirewallRules {
-    param(
-        [string]$LabelA, $DataA,
-        [string]$LabelB, $DataB
-    )
+    param([string]$LabelA, $DataA, [string]$LabelB, $DataB)
     Write-Section "Firewall Rule Comparison: $LabelA vs $LabelB"
 
     if (-not $DataA.FirewallRules -or -not $DataB.FirewallRules) {
         Add-Finding -Category "FirewallRules" -Severity "INFO" `
-            -Description "One or both datasets have no firewall rules recorded — skipping rule diff for $LabelA vs $LabelB"
+            -Description "One or both datasets have no firewall rules - skipping rule diff for $LabelA vs $LabelB"
         return
     }
 
-    $keysA = $DataA.FirewallRules | ForEach-Object { Get-RuleKey $_ }
-    $keysB = $DataB.FirewallRules | ForEach-Object { Get-RuleKey $_ }
-
+    $keysA      = $DataA.FirewallRules | ForEach-Object { Get-RuleKey $_ }
+    $keysB      = $DataB.FirewallRules | ForEach-Object { Get-RuleKey $_ }
     $missingInB = $DataA.FirewallRules | Where-Object { (Get-RuleKey $_) -notin $keysB }
     $newInB     = $DataB.FirewallRules | Where-Object { (Get-RuleKey $_) -notin $keysA }
 
@@ -154,131 +166,195 @@ function Compare-FirewallRules {
     }
 }
 
-# Helper: run an NSG diff between two named datasets
-function Compare-NsgRules {
-    param(
-        [string]$LabelA, $DataA,
-        [string]$LabelB, $DataB
-    )
-    Write-Section "NSG Rule Comparison: $LabelA vs $LabelB"
+function Compare-ASGMembership {
+    param([string]$LabelA, $DataA, [string]$LabelB, $DataB)
+    Write-Section "ASG Membership Comparison: $LabelA vs $LabelB"
+
+    if (-not $DataA.IsAzure -or -not $DataB.IsAzure) {
+        Add-Finding -Category "ASGMembership" -Severity "INFO" `
+            -Description "ASG comparison skipped - one or both phases are not Azure ($LabelA IsAzure:$($DataA.IsAzure) | $LabelB IsAzure:$($DataB.IsAzure))"
+        return
+    }
+
+    $asgNamesA = @($DataA.ASGMemberships | ForEach-Object { $_.ASGName } | Sort-Object)
+    $asgNamesB = @($DataB.ASGMemberships | ForEach-Object { $_.ASGName } | Sort-Object)
+
+    $missingInB = $asgNamesA | Where-Object { $_ -notin $asgNamesB }
+    $newInB     = $asgNamesB | Where-Object { $_ -notin $asgNamesA }
+
+    foreach ($asg in $missingInB) {
+        Add-Finding -Category "ASGMembership" -Severity "FAIL" `
+            -Description "ASG '$asg' present in $LabelA but MISSING from $LabelB" `
+            -Detail "Any NSG rules scoped to this ASG will NOT apply to $LabelB."
+    }
+    foreach ($asg in $newInB) {
+        Add-Finding -Category "ASGMembership" -Severity "INFO" `
+            -Description "ASG '$asg' present in $LabelB but not in $LabelA (new membership)" `
+            -Detail "Verify this ASG membership is intentional."
+    }
+    if (-not $missingInB -and -not $newInB) {
+        Add-Finding -Category "ASGMembership" -Severity "PASS" `
+            -Description "ASG memberships identical between $LabelA and $LabelB ($($asgNamesA -join ', '))"
+    }
+}
+
+function Compare-NSGRawRules {
+    param([string]$LabelA, $DataA, [string]$LabelB, $DataB)
+    Write-Section "NSG Raw Rule Comparison (ASG names preserved): $LabelA vs $LabelB"
+
+    if (-not $DataA.IsAzure -or -not $DataB.IsAzure) {
+        Add-Finding -Category "NSGRawRules" -Severity "INFO" `
+            -Description "Raw NSG rule comparison skipped - one or both phases are not Azure"
+        return
+    }
+
+    $rulesA = $DataA.NSGRawRules
+    $rulesB = $DataB.NSGRawRules
+
+    if (-not $rulesA -or $rulesA.Count -eq 0) {
+        Add-Finding -Category "NSGRawRules" -Severity "INFO" `
+            -Description "No raw NSG rules recorded in $LabelA"
+        return
+    }
+    if (-not $rulesB -or $rulesB.Count -eq 0) {
+        Add-Finding -Category "NSGRawRules" -Severity "WARN" `
+            -Description "No raw NSG rules recorded in $LabelB"
+        return
+    }
+
+    $keysA = $rulesA | ForEach-Object { Get-NsgRawKey $_ }
+    $keysB = $rulesB | ForEach-Object { Get-NsgRawKey $_ }
+
+    # All rules
+    $missingInB = $rulesA | Where-Object { (Get-NsgRawKey $_) -notin $keysB }
+    $newInB     = $rulesB | Where-Object { (Get-NsgRawKey $_) -notin $keysA }
+
+    foreach ($r in $missingInB) {
+        $sev    = if ($r.IsASGRule) { 'FAIL' } else { 'WARN' }
+        $srcStr = if ($r.SourceASGs) { "SourceASG:$($r.SourceASGs)" } else { "Src:$($r.SourceAddressPrefix)" }
+        $dstStr = if ($r.DestinationASGs) { "DstASG:$($r.DestinationASGs)" } else { "Dst:$($r.DestinationAddressPrefix)" }
+        Add-Finding -Category "NSGRawRules" -Severity $sev `
+            -Description "NSG rule '$($r.Name)' in $LabelA missing from $LabelB$(if ($r.IsASGRule) {' [ASG-SCOPED]'})" `
+            -Detail "P:$($r.Priority) | $($r.Access) | $($r.Protocol) | $srcStr | DstPort:$($r.DestinationPortRange) | $dstStr"
+    }
+    foreach ($r in $newInB) {
+        $srcStr = if ($r.SourceASGs) { "SourceASG:$($r.SourceASGs)" } else { "Src:$($r.SourceAddressPrefix)" }
+        $dstStr = if ($r.DestinationASGs) { "DstASG:$($r.DestinationASGs)" } else { "Dst:$($r.DestinationAddressPrefix)" }
+        Add-Finding -Category "NSGRawRules" -Severity "INFO" `
+            -Description "NSG rule '$($r.Name)' in $LabelB not present in $LabelA$(if ($r.IsASGRule) {' [ASG-SCOPED]'})" `
+            -Detail "P:$($r.Priority) | $($r.Access) | $($r.Protocol) | $srcStr | DstPort:$($r.DestinationPortRange) | $dstStr"
+    }
+    if (-not $missingInB -and -not $newInB) {
+        Add-Finding -Category "NSGRawRules" -Severity "PASS" `
+            -Description "All NSG raw rules (including ASG-scoped) identical between $LabelA and $LabelB"
+    }
+}
+
+function Compare-NSGEffectiveRules {
+    param([string]$LabelA, $DataA, [string]$LabelB, $DataB)
+    Write-Section "NSG Effective Rule Comparison (resolved/flattened): $LabelA vs $LabelB"
+
+    if (-not $DataA.IsAzure -or -not $DataB.IsAzure) {
+        Add-Finding -Category "NSGEffective" -Severity "INFO" `
+            -Description "NSG effective comparison skipped - one or both phases are not Azure"
+        return
+    }
 
     $rulesA = $DataA.NSGEffectiveRules
     $rulesB = $DataB.NSGEffectiveRules
 
-    if (-not $DataA.IsAzure -or -not $DataB.IsAzure) {
-        Add-Finding -Category "NSG" -Severity "INFO" `
-            -Description "NSG comparison skipped — one or both phases are not Azure ($LabelA IsAzure:$($DataA.IsAzure) | $LabelB IsAzure:$($DataB.IsAzure))"
-        return
-    }
     if (-not $rulesA -or $rulesA.Count -eq 0) {
-        Add-Finding -Category "NSG" -Severity "INFO" `
-            -Description "No NSG rules recorded in $LabelA — Az.Network may not have been available"
+        Add-Finding -Category "NSGEffective" -Severity "INFO" `
+            -Description "No effective NSG rules in $LabelA - Az.Network may not have been available"
         return
     }
     if (-not $rulesB -or $rulesB.Count -eq 0) {
-        Add-Finding -Category "NSG" -Severity "WARN" `
-            -Description "No NSG rules recorded in $LabelB — Az.Network may not have been available"
+        Add-Finding -Category "NSGEffective" -Severity "WARN" `
+            -Description "No effective NSG rules in $LabelB - Az.Network may not have been available"
         return
     }
 
-    $keysA = $rulesA | ForEach-Object { Get-NsgKey $_ }
-    $keysB = $rulesB | ForEach-Object { Get-NsgKey $_ }
-
-    $missingInB = $rulesA | Where-Object { (Get-NsgKey $_) -notin $keysB }
-    $newInB     = $rulesB | Where-Object { (Get-NsgKey $_) -notin $keysA }
+    $keysA      = $rulesA | ForEach-Object { Get-NsgEffectiveKey $_ }
+    $keysB      = $rulesB | ForEach-Object { Get-NsgEffectiveKey $_ }
+    $missingInB = $rulesA | Where-Object { (Get-NsgEffectiveKey $_) -notin $keysB }
+    $newInB     = $rulesB | Where-Object { (Get-NsgEffectiveKey $_) -notin $keysA }
 
     foreach ($r in $missingInB) {
-        Add-Finding -Category "NSG" -Severity "FAIL" `
-            -Description "NSG rule in $LabelA missing from $LabelB" `
-            -Detail "Priority:$($r.Priority) | $($r.Access) | Proto:$($r.Protocol) | Src:$($r.SourceAddressPrefix) | DstPort:$($r.DestinationPortRange)"
+        Add-Finding -Category "NSGEffective" -Severity "FAIL" `
+            -Description "Effective NSG rule in $LabelA missing from $LabelB" `
+            -Detail "P:$($r.Priority) | $($r.Access) | $($r.Protocol) | Src:$($r.SourceAddressPrefix) | DstPort:$($r.DestinationPortRange)"
     }
     foreach ($r in $newInB) {
-        Add-Finding -Category "NSG" -Severity "INFO" `
-            -Description "NSG rule in $LabelB not present in $LabelA (new rule)" `
-            -Detail "Priority:$($r.Priority) | $($r.Access) | Proto:$($r.Protocol) | Src:$($r.SourceAddressPrefix) | DstPort:$($r.DestinationPortRange)"
+        Add-Finding -Category "NSGEffective" -Severity "INFO" `
+            -Description "Effective NSG rule in $LabelB not present in $LabelA" `
+            -Detail "P:$($r.Priority) | $($r.Access) | $($r.Protocol) | Src:$($r.SourceAddressPrefix) | DstPort:$($r.DestinationPortRange)"
     }
     if (-not $missingInB -and -not $newInB) {
-        Add-Finding -Category "NSG" -Severity "PASS" `
+        Add-Finding -Category "NSGEffective" -Severity "PASS" `
             -Description "NSG effective inbound rules identical between $LabelA and $LabelB"
     }
 }
 
-# Helper: run an IP Flow diff between two named datasets
 function Compare-IPFlow {
-    param(
-        [string]$LabelA, $DataA,
-        [string]$LabelB, $DataB
-    )
+    param([string]$LabelA, $DataA, [string]$LabelB, $DataB)
     Write-Section "IP Flow Verify Comparison: $LabelA vs $LabelB"
+
+    if (-not $DataA.IsAzure -or -not $DataB.IsAzure) {
+        Add-Finding -Category "IPFlow" -Severity "INFO" `
+            -Description "IP Flow comparison skipped - one or both phases are not Azure"
+        return
+    }
 
     $flowsA = $DataA.IPFlowResults
     $flowsB = $DataB.IPFlowResults
 
-    if (-not $DataA.IsAzure -or -not $DataB.IsAzure) {
-        Add-Finding -Category "IPFlow" -Severity "INFO" `
-            -Description "IP Flow comparison skipped — one or both phases are not Azure ($LabelA IsAzure:$($DataA.IsAzure) | $LabelB IsAzure:$($DataB.IsAzure))"
-        return
-    }
     if (-not $flowsA -or $flowsA.Count -eq 0) {
         Add-Finding -Category "IPFlow" -Severity "INFO" `
-            -Description "No IP Flow results in $LabelA — Az.Network may not have been available"
+            -Description "No IP Flow results in $LabelA - Az.Network may not have been available"
         return
     }
     if (-not $flowsB -or $flowsB.Count -eq 0) {
         Add-Finding -Category "IPFlow" -Severity "WARN" `
-            -Description "No IP Flow results in $LabelB — Az.Network may not have been available"
+            -Description "No IP Flow results in $LabelB - Az.Network may not have been available"
         return
     }
 
     foreach ($flowA in $flowsA) {
         $flowB = $flowsB | Where-Object {
-            $_.SourceHost -eq $flowA.SourceHost -and $_.Port -eq $flowA.Port
+            $_.SourceLabel -eq $flowA.SourceLabel -and $_.Port -eq $flowA.Port
         } | Select-Object -First 1
 
         if (-not $flowB) {
             Add-Finding -Category "IPFlow" -Severity "WARN" `
-                -Description "No IP Flow result for $($flowA.SourceHost):$($flowA.Port) in $LabelB"
+                -Description "No IP Flow result for '$($flowA.SourceLabel)':$($flowA.Port) in $LabelB"
             continue
         }
+
+        $asgTag = if ($flowA.SourceType -eq 'ASGMember') { ' [ASG]' } else { '' }
 
         if ($flowA.Access -ne $flowB.Access) {
             $sev = if ($flowB.Access -eq 'Deny') { 'FAIL' } else { 'WARN' }
             Add-Finding -Category "IPFlow" -Severity $sev `
-                -Description "IP Flow access changed: $($flowA.SourceHost) -> :$($flowA.Port)" `
+                -Description "IP Flow access changed$asgTag : '$($flowA.SourceLabel)' -> :$($flowA.Port)" `
                 -Detail "$LabelA : $($flowA.Access) [$($flowA.RuleName)]  |  $LabelB : $($flowB.Access) [$($flowB.RuleName)]"
         } else {
             Add-Finding -Category "IPFlow" -Severity "PASS" `
-                -Description "IP Flow $($flowA.SourceHost) -> :$($flowA.Port) : $($flowA.Access) (consistent)"
+                -Description "IP Flow$asgTag '$($flowA.SourceLabel)' -> :$($flowA.Port) : $($flowA.Access) (consistent)"
         }
     }
 
-    # Flag any outright denies in B regardless of A
+    # Flag any Deny in B outright
     $denied = $flowsB | Where-Object { $_.Access -eq 'Deny' }
     foreach ($d in $denied) {
+        $asgTag = if ($d.SourceType -eq 'ASGMember') { ' [ASG]' } else { '' }
         Add-Finding -Category "IPFlow" -Severity "FAIL" `
-            -Description "Inbound DENIED in $LabelB : $($d.SourceHost) -> :$($d.Port)" `
+            -Description "Inbound DENIED in $LabelB$asgTag : '$($d.SourceLabel)' -> :$($d.Port)" `
             -Detail "Blocking rule: $($d.RuleName)"
     }
 }
 
-# Helper: check firewall and connection profiles for a single dataset
-function Test-FirewallProfiles {
-    param([string]$Label, $Data)
-
-    foreach ($cp in $Data.ConnectionProfiles) {
-        if ($cp.NetworkCategory -ne 'DomainAuthenticated') {
-            Add-Finding -Category "FirewallProfile" -Severity "FAIL" `
-                -Description "$Label : Interface '$($cp.InterfaceAlias)' is on '$($cp.NetworkCategory)' — expected DomainAuthenticated" `
-                -Detail "The wrong firewall rule set will apply."
-        } else {
-            Add-Finding -Category "FirewallProfile" -Severity "PASS" `
-                -Description "$Label : Interface '$($cp.InterfaceAlias)' correctly on DomainAuthenticated"
-        }
-    }
-}
-
 # ---------------------------------------------------------------------------
-# Load whichever files were supplied
+# Load files
 # ---------------------------------------------------------------------------
 Write-Section "Loading Audit Files"
 
@@ -290,70 +366,67 @@ if ($pre) { Write-Host "Pre-Migration  : $($pre.Hostname) @ $($pre.Timestamp)"  
 if ($ref) { Write-Host "Azure Reference: $($ref.Hostname) @ $($ref.Timestamp)"  -ForegroundColor Yellow }
 if ($mig) { Write-Host "Azure Migrated : $($mig.Hostname) @ $($mig.Timestamp)"  -ForegroundColor Yellow }
 
-# Summarise which comparisons will run
 Write-Host ""
-if ($pre -and $ref -and $mig) {
-    Write-Host "Mode: Full three-phase comparison" -ForegroundColor Cyan
-} elseif ($ref -and $mig) {
-    Write-Host "Mode: Reference vs Migrated" -ForegroundColor Cyan
-} elseif ($pre -and $mig) {
-    Write-Host "Mode: Pre-Migration vs Migrated" -ForegroundColor Cyan
-} elseif ($pre -and $ref) {
-    Write-Host "Mode: Pre-Migration vs Reference (planning)" -ForegroundColor Cyan
-}
+if      ($pre -and $ref -and $mig) { Write-Host "Mode: Full three-phase comparison"              -ForegroundColor Cyan }
+elseif  ($ref -and $mig)           { Write-Host "Mode: Reference vs Migrated"                    -ForegroundColor Cyan }
+elseif  ($pre -and $mig)           { Write-Host "Mode: Pre-Migration vs Migrated"                -ForegroundColor Cyan }
+elseif  ($pre -and $ref)           { Write-Host "Mode: Pre-Migration vs Reference (planning)"    -ForegroundColor Cyan }
 
 # ---------------------------------------------------------------------------
-# Connection profile checks — run for every supplied Azure phase
+# Run checks
 # ---------------------------------------------------------------------------
+
+# Connection profile checks (Azure phases only)
 Write-Section "Firewall Connection Profile Checks"
-
 if ($ref) { Test-FirewallProfiles -Label "AzureReference" -Data $ref }
 if ($mig) { Test-FirewallProfiles -Label "AzureMigrated"  -Data $mig }
 
-# ---------------------------------------------------------------------------
 # Firewall profile default action diffs
-# ---------------------------------------------------------------------------
-$profilePairs = @()
-if ($pre -and $ref) { $profilePairs += @{ LabelA='PreMigration'; A=$pre; LabelB='AzureReference'; B=$ref } }
-if ($pre -and $mig) { $profilePairs += @{ LabelA='PreMigration'; A=$pre; LabelB='AzureMigrated';  B=$mig } }
-if ($ref -and $mig) { $profilePairs += @{ LabelA='AzureReference'; A=$ref; LabelB='AzureMigrated'; B=$mig } }
+$pairs = @()
+if ($pre -and $ref) { $pairs += @{ LA='PreMigration';   A=$pre; LB='AzureReference'; B=$ref } }
+if ($pre -and $mig) { $pairs += @{ LA='PreMigration';   A=$pre; LB='AzureMigrated';  B=$mig } }
+if ($ref -and $mig) { $pairs += @{ LA='AzureReference'; A=$ref; LB='AzureMigrated';  B=$mig } }
 
-foreach ($pair in $profilePairs) {
-    Write-Section "Firewall Profile Defaults: $($pair.LabelA) vs $($pair.LabelB)"
-    foreach ($profA in $pair.A.FirewallProfiles) {
-        $profB = $pair.B.FirewallProfiles | Where-Object { $_.Name -eq $profA.Name }
+foreach ($p in $pairs) {
+    Write-Section "Firewall Profile Defaults: $($p.LA) vs $($p.LB)"
+    foreach ($profA in $p.A.FirewallProfiles) {
+        $profB = $p.B.FirewallProfiles | Where-Object { $_.Name -eq $profA.Name }
         if (-not $profB) { continue }
         if ($profA.DefaultInboundAction -ne $profB.DefaultInboundAction) {
             Add-Finding -Category "FirewallProfile" -Severity "WARN" `
-                -Description "Profile '$($profA.Name)' DefaultInboundAction differs: $($pair.LabelA) vs $($pair.LabelB)" `
-                -Detail "$($pair.LabelA): $($profA.DefaultInboundAction)  |  $($pair.LabelB): $($profB.DefaultInboundAction)"
+                -Description "Profile '$($profA.Name)' DefaultInboundAction differs: $($p.LA) vs $($p.LB)" `
+                -Detail "$($p.LA): $($profA.DefaultInboundAction)  |  $($p.LB): $($profB.DefaultInboundAction)"
         }
         if ($profA.Enabled -ne $profB.Enabled) {
             Add-Finding -Category "FirewallProfile" -Severity "WARN" `
-                -Description "Profile '$($profA.Name)' Enabled state differs: $($pair.LabelA) vs $($pair.LabelB)" `
-                -Detail "$($pair.LabelA): $($profA.Enabled)  |  $($pair.LabelB): $($profB.Enabled)"
+                -Description "Profile '$($profA.Name)' Enabled state differs: $($p.LA) vs $($p.LB)" `
+                -Detail "$($p.LA): $($profA.Enabled)  |  $($p.LB): $($profB.Enabled)"
         }
     }
 }
 
-# ---------------------------------------------------------------------------
-# Firewall rule diffs — all available pairs
-# ---------------------------------------------------------------------------
-if ($pre -and $ref) { Compare-FirewallRules -LabelA "PreMigration" -DataA $pre -LabelB "AzureReference" -DataB $ref }
-if ($pre -and $mig) { Compare-FirewallRules -LabelA "PreMigration" -DataA $pre -LabelB "AzureMigrated"  -DataB $mig }
-if ($ref -and $mig) { Compare-FirewallRules -LabelA "AzureReference" -DataA $ref -LabelB "AzureMigrated" -DataB $mig }
+# Firewall rules
+if ($pre -and $ref) { Compare-FirewallRules -LabelA "PreMigration"   -DataA $pre -LabelB "AzureReference" -DataB $ref }
+if ($pre -and $mig) { Compare-FirewallRules -LabelA "PreMigration"   -DataA $pre -LabelB "AzureMigrated"  -DataB $mig }
+if ($ref -and $mig) { Compare-FirewallRules -LabelA "AzureReference" -DataA $ref -LabelB "AzureMigrated"  -DataB $mig }
 
-# ---------------------------------------------------------------------------
-# NSG diffs — Azure pairs only
-# ---------------------------------------------------------------------------
-if ($ref -and $mig) { Compare-NsgRules -LabelA "AzureReference" -DataA $ref -LabelB "AzureMigrated" -DataB $mig }
-if ($pre -and $ref) { Compare-NsgRules -LabelA "PreMigration"   -DataA $pre -LabelB "AzureReference" -DataB $ref }
-if ($pre -and $mig) { Compare-NsgRules -LabelA "PreMigration"   -DataA $pre -LabelB "AzureMigrated"  -DataB $mig }
+# ASG membership - Azure pairs only
+if ($ref -and $mig) { Compare-ASGMembership -LabelA "AzureReference" -DataA $ref -LabelB "AzureMigrated"  -DataB $mig }
+if ($pre -and $ref) { Compare-ASGMembership -LabelA "PreMigration"   -DataA $pre -LabelB "AzureReference" -DataB $ref }
+if ($pre -and $mig) { Compare-ASGMembership -LabelA "PreMigration"   -DataA $pre -LabelB "AzureMigrated"  -DataB $mig }
 
-# ---------------------------------------------------------------------------
-# IP Flow diffs — Azure pairs only
-# ---------------------------------------------------------------------------
-if ($ref -and $mig) { Compare-IPFlow -LabelA "AzureReference" -DataA $ref -LabelB "AzureMigrated" -DataB $mig }
+# NSG raw rules (ASG names preserved) - Azure pairs only
+if ($ref -and $mig) { Compare-NSGRawRules -LabelA "AzureReference" -DataA $ref -LabelB "AzureMigrated"  -DataB $mig }
+if ($pre -and $ref) { Compare-NSGRawRules -LabelA "PreMigration"   -DataA $pre -LabelB "AzureReference" -DataB $ref }
+if ($pre -and $mig) { Compare-NSGRawRules -LabelA "PreMigration"   -DataA $pre -LabelB "AzureMigrated"  -DataB $mig }
+
+# NSG effective rules (flattened) - Azure pairs only
+if ($ref -and $mig) { Compare-NSGEffectiveRules -LabelA "AzureReference" -DataA $ref -LabelB "AzureMigrated"  -DataB $mig }
+if ($pre -and $ref) { Compare-NSGEffectiveRules -LabelA "PreMigration"   -DataA $pre -LabelB "AzureReference" -DataB $ref }
+if ($pre -and $mig) { Compare-NSGEffectiveRules -LabelA "PreMigration"   -DataA $pre -LabelB "AzureMigrated"  -DataB $mig }
+
+# IP Flow Verify - Azure pairs only
+if ($ref -and $mig) { Compare-IPFlow -LabelA "AzureReference" -DataA $ref -LabelB "AzureMigrated"  -DataB $mig }
 if ($pre -and $ref) { Compare-IPFlow -LabelA "PreMigration"   -DataA $pre -LabelB "AzureReference" -DataB $ref }
 if ($pre -and $mig) { Compare-IPFlow -LabelA "PreMigration"   -DataA $pre -LabelB "AzureMigrated"  -DataB $mig }
 
@@ -430,7 +503,7 @@ $html = @"
 </style>
 </head>
 <body>
-<h1>Firewall Audit — Migration Comparison Report</h1>
+<h1>Firewall Audit - Migration Comparison Report</h1>
 <p class="meta">Generated: $(Get-Date -Format 'dd MMM yyyy HH:mm:ss')</p>
 
 <div class="phases">
