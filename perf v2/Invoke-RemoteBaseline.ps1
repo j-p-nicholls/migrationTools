@@ -83,19 +83,55 @@ $sshMuxOpts = @(
     "-o", "ControlPersist=5m"
 )
 
+$script:MasterProcess = $null
+
 function Start-MasterConnection {
     Write-Host "Connecting to $target (you'll be prompted once)..."
-    # -f backgrounds after auth, -N opens no command channel, -M forces master mode
-    $args = @("-f", "-N", "-M") + $sshMuxOpts + @($target)
-    $proc = Start-Process -FilePath "ssh" -ArgumentList $args -NoNewWindow -PassThru -Wait
-    if ($proc.ExitCode -ne 0) {
-        throw "Failed to establish SSH master connection to $target"
+
+    # Remove a stale socket from a previous crashed run, if present
+    if (Test-Path $controlPath) {
+        Remove-Item $controlPath -Force -ErrorAction SilentlyContinue
+    }
+
+    # Deliberately NOT using -f here: Windows OpenSSH's -f (background after
+    # auth) is unreliable when launched via Start-Process and causes
+    # "getsockname failed: Not a socket" errors. Instead we launch ssh in
+    # the foreground of a tracked, hidden background process and leave it
+    # running for the lifetime of this script.
+    $args = @("-N", "-M") + $sshMuxOpts + @($target)
+    $script:MasterProcess = Start-Process -FilePath "ssh" -ArgumentList $args -NoNewWindow -PassThru
+
+    # Wait for the control socket to appear, confirming auth succeeded and
+    # the master connection is up. Poll rather than fixed-sleep so this
+    # doesn't hang if auth is quick, and times out if something's wrong.
+    $timeoutSeconds = 60
+    $elapsed = 0
+    while (-not (Test-Path $controlPath) -and $elapsed -lt $timeoutSeconds) {
+        if ($script:MasterProcess.HasExited) {
+            throw "SSH master connection process exited before completing auth (exit code $($script:MasterProcess.ExitCode)). Check host/credentials."
+        }
+        Start-Sleep -Milliseconds 500
+        $elapsed += 0.5
+    }
+
+    if (-not (Test-Path $controlPath)) {
+        throw "Timed out waiting for SSH master connection to $target"
     }
 }
 
 function Stop-MasterConnection {
+    # Ask the master to close cleanly first
     $args = @("-O", "exit") + $sshMuxOpts + @($target)
     Start-Process -FilePath "ssh" -ArgumentList $args -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+
+    # Belt-and-braces: make sure the tracked process is actually gone
+    if ($script:MasterProcess -and -not $script:MasterProcess.HasExited) {
+        Stop-Process -Id $script:MasterProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+
+    if (Test-Path $controlPath) {
+        Remove-Item $controlPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 try {
