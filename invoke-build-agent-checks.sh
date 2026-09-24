@@ -60,7 +60,8 @@ JSON_PATH="$OUTDIR/BuildAgentChecks_${PHASE}_${HOSTNAME_VAL}.json"
 HTML_PATH="$OUTDIR/BuildAgentChecks_${PHASE}_${HOSTNAME_VAL}.html"
 RESULTS_TMP="$(mktemp)"
 TOOLVER_TMP="$(mktemp)"
-trap 'rm -f "$RESULTS_TMP" "$TOOLVER_TMP"' EXIT
+AGENT_ACCOUNTS_FILE="$(mktemp)"
+trap 'rm -f "$RESULTS_TMP" "$TOOLVER_TMP" "$AGENT_ACCOUNTS_FILE"' EXIT
 
 echo "=== Build Agent Checks: $HOSTNAME_VAL [$PHASE] ==="
 
@@ -99,6 +100,24 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 # ---- 1. Orchestrator / agent registration -------------------------------
 echo -e "\n[1/5] Orchestrator agent registration..."
 
+# Track the account(s) each detected agent service actually runs as, so
+# later checks (config files) look in the right home directory rather
+# than whichever account is running this script (SSH/sudo user).
+add_agent_account() {
+    local acct="$1"
+    [[ -n "$acct" ]] && echo "$acct" >> "$AGENT_ACCOUNTS_FILE"
+}
+
+# systemd exposes the configured run-as account via `User=` in the unit;
+# an empty value means it defaults to root.
+get_unit_user() {
+    local unit="$1"
+    local u
+    u="$(systemctl show "$unit" -p User --value 2>/dev/null)"
+    [[ -z "$u" ]] && u="root"
+    echo "$u"
+}
+
 # Azure DevOps agent (self-hosted Linux agent runs as a systemd service,
 # typically named vstsagent.* or a custom unit installed via svc.sh)
 ADO_UNITS="$(systemctl list-units --type=service --all 2>/dev/null | grep -i 'vstsagent' | awk '{print $1}')"
@@ -106,7 +125,9 @@ if [[ -n "$ADO_UNITS" ]]; then
     while IFS= read -r unit; do
         state="$(systemctl is-active "$unit" 2>/dev/null)"
         status="FAIL"; [[ "$state" == "active" ]] && status="PASS"
-        add_result "AgentRegistration" "ADO Agent Service: $unit" "$status" "systemd state: $state"
+        runas="$(get_unit_user "$unit")"
+        add_result "AgentRegistration" "ADO Agent Service: $unit" "$status" "systemd state: $state, RunsAs: $runas"
+        add_agent_account "$runas"
     done <<< "$ADO_UNITS"
 else
     add_result "AgentRegistration" "Azure DevOps Agent Service" "INFO" "No vstsagent* systemd unit found"
@@ -118,10 +139,16 @@ if [[ -n "$JENKINS_UNIT" ]]; then
     while IFS= read -r unit; do
         state="$(systemctl is-active "$unit" 2>/dev/null)"
         status="FAIL"; [[ "$state" == "active" ]] && status="PASS"
-        add_result "AgentRegistration" "Jenkins Service: $unit" "$status" "systemd state: $state"
+        runas="$(get_unit_user "$unit")"
+        add_result "AgentRegistration" "Jenkins Service: $unit" "$status" "systemd state: $state, RunsAs: $runas"
+        add_agent_account "$runas"
     done <<< "$JENKINS_UNIT"
 elif pgrep -f 'agent.jar|swarm-client' >/dev/null 2>&1; then
-    add_result "AgentRegistration" "Jenkins Agent Process" "PASS" "agent.jar/swarm-client process running"
+    # No systemd unit — fall back to the actual owning user of the running process
+    jenkins_pid="$(pgrep -f 'agent.jar|swarm-client' | head -n1)"
+    runas="$(ps -o user= -p "$jenkins_pid" 2>/dev/null | tr -d ' ')"
+    add_result "AgentRegistration" "Jenkins Agent Process" "PASS" "agent.jar/swarm-client process running, RunsAs: ${runas:-unknown}"
+    add_agent_account "$runas"
 else
     add_result "AgentRegistration" "Jenkins Agent" "INFO" "No jenkins systemd unit or agent.jar process found"
 fi
@@ -130,7 +157,14 @@ fi
 if have_cmd gitlab-runner; then
     state="$(systemctl is-active gitlab-runner 2>/dev/null)"
     status="FAIL"; [[ "$state" == "active" ]] && status="PASS"
-    add_result "AgentRegistration" "GitLab Runner Service" "$status" "systemd state: $state"
+    if systemctl list-units --type=service --all 2>/dev/null | grep -q 'gitlab-runner'; then
+        runas="$(get_unit_user gitlab-runner)"
+    else
+        gl_pid="$(pgrep -f 'gitlab-runner run' | head -n1)"
+        runas="$(ps -o user= -p "$gl_pid" 2>/dev/null | tr -d ' ')"
+    fi
+    add_result "AgentRegistration" "GitLab Runner Service" "$status" "systemd state: $state, RunsAs: ${runas:-unknown}"
+    add_agent_account "$runas"
 
     runner_list="$(gitlab-runner list 2>&1)"
     add_result "AgentRegistration" "GitLab Runner Registration List" "INFO" "$runner_list"
@@ -142,7 +176,17 @@ if [[ -z "$ADO_UNITS" && -z "$JENKINS_UNIT" && ! $(pgrep -f 'agent.jar|swarm-cli
     add_result "AgentRegistration" "Orchestrator Detection" "WARN" "No known orchestrator agent (ADO/Jenkins/GitLab) detected — verify manually"
 fi
 
-# ---- 2. Toolchain version capture ---------------------------------------
+# Dedupe agent accounts
+AGENT_ACCOUNTS="$(sort -u "$AGENT_ACCOUNTS_FILE" 2>/dev/null)"
+
+# Resolve an account's home directory via getent (works for both local
+# and directory-backed — e.g. SSSD/LDAP — accounts, unlike trusting $HOME).
+resolve_account_home() {
+    local acct="$1"
+    getent passwd "$acct" 2>/dev/null | cut -d: -f6
+}
+
+
 echo -e "\n[2/5] Toolchain version capture..."
 
 declare -A TOOL_VERSIONS
@@ -179,8 +223,14 @@ done
 # ---- 3. Environment & config capture ------------------------------------
 echo -e "\n[3/5] Environment and config capture..."
 
+# NOTE: $PATH and the env vars below reflect the account running THIS
+# script (typically your SSH/sudo session), which may differ from the
+# build agent's own service account. Use the AgentServiceAccount checks
+# below for what the agent process itself actually sees.
+add_result "Environment" "Script Running As" "INFO" "$(whoami) (interactive/test account — see AgentServiceAccount checks below for the actual agent identity)"
+
 PATH_COUNT="$(echo "$PATH" | tr ':' '\n' | grep -c .)"
-add_result "Environment" "PATH Entry Count" "INFO" "$PATH_COUNT entries"
+add_result "Environment" "PATH Entry Count (current session)" "INFO" "$PATH_COUNT entries"
 
 for var in JAVA_HOME DOTNET_ROOT NODE_ENV NPM_CONFIG_PREFIX PYTHONPATH MAVEN_HOME M2_HOME GOPATH GOROOT DOCKER_HOST; do
     if [[ -n "${!var:-}" ]]; then
@@ -188,20 +238,45 @@ for var in JAVA_HOME DOTNET_ROOT NODE_ENV NPM_CONFIG_PREFIX PYTHONPATH MAVEN_HOM
     fi
 done
 
-declare -A CONFIG_PATHS=(
-    ["NuGet.Config"]="$HOME/.nuget/NuGet/NuGet.Config"
-    [".npmrc (user)"]="$HOME/.npmrc"
-    ["pip.conf"]="$HOME/.config/pip/pip.conf"
-    ["Maven settings"]="$HOME/.m2/settings.xml"
-)
-for name in "${!CONFIG_PATHS[@]}"; do
-    path="${CONFIG_PATHS[$name]}"
-    if [[ -f "$path" ]]; then
-        add_result "Environment" "Config present: $name" "PASS" "$path"
-    else
-        add_result "Environment" "Config present: $name" "INFO" "Not found at $path"
-    fi
-done
+# Package manager config files — checked per detected agent service
+# account, not the SSH/sudo session's own $HOME, since that's what the
+# agent process actually reads from.
+if [[ -z "$AGENT_ACCOUNTS" ]]; then
+    add_result "Environment" "Agent Service Account Config Check" "WARN" \
+        "No agent service account was identified in section 1 — skipping per-account config checks. Config files under your own \$HOME are NOT representative of the agent."
+else
+    while IFS= read -r account; do
+        [[ -z "$account" ]] && continue
+        acct_home="$(resolve_account_home "$account")"
+
+        if [[ -z "$acct_home" ]]; then
+            add_result "Environment" "Agent Service Account: $account" "WARN" \
+                "Could not resolve a home directory via getent passwd — account may not exist locally (e.g. AD/SSSD lookup issue) or config lives elsewhere"
+            continue
+        fi
+
+        add_result "Environment" "Agent Service Account: $account" "PASS" "Home: $acct_home"
+
+        declare -A CONFIG_PATHS=(
+            ["NuGet.Config"]="$acct_home/.nuget/NuGet/NuGet.Config"
+            [".npmrc (user)"]="$acct_home/.npmrc"
+            ["pip.conf"]="$acct_home/.config/pip/pip.conf"
+            ["Maven settings"]="$acct_home/.m2/settings.xml"
+        )
+        for name in "${!CONFIG_PATHS[@]}"; do
+            path="${CONFIG_PATHS[$name]}"
+            # Reading another account's home may fail on permissions even
+            # when running as root over some restrictive umask setups.
+            if [[ -r "$path" ]]; then
+                add_result "Environment" "[$account] Config present: $name" "PASS" "$path"
+            elif [[ -e "$path" ]]; then
+                add_result "Environment" "[$account] Config present: $name" "WARN" "Exists at $path but not readable by current user — re-run as root/sudo to confirm contents"
+            else
+                add_result "Environment" "[$account] Config present: $name" "INFO" "Not found at $path"
+            fi
+        done
+    done <<< "$AGENT_ACCOUNTS"
+fi
 
 # ---- 4. Network reachability (source control / registries) --------------
 echo -e "\n[4/5] Network reachability to source control / registries..."
