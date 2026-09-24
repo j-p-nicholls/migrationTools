@@ -118,9 +118,11 @@ get_unit_user() {
     echo "$u"
 }
 
-# Azure DevOps agent (self-hosted Linux agent runs as a systemd service,
-# typically named vstsagent.* or a custom unit installed via svc.sh)
-ADO_UNITS="$(systemctl list-units --type=service --all 2>/dev/null | grep -i 'vstsagent' | awk '{print $1}')"
+# Azure DevOps agent (self-hosted Linux agent runs as a systemd service).
+# The real-world unit name is typically "vsts.agent.<pool>.<agentname>.service"
+# (dotted, with pool/agent name embedded) — match loosely on "vsts" + "agent"
+# regardless of separator, rather than the literal string "vstsagent".
+ADO_UNITS="$(systemctl list-units --type=service --all 2>/dev/null | grep -iE 'vsts.{0,3}agent' | awk '{print $1}')"
 if [[ -n "$ADO_UNITS" ]]; then
     while IFS= read -r unit; do
         state="$(systemctl is-active "$unit" 2>/dev/null)"
@@ -130,7 +132,7 @@ if [[ -n "$ADO_UNITS" ]]; then
         add_agent_account "$runas"
     done <<< "$ADO_UNITS"
 else
-    add_result "AgentRegistration" "Azure DevOps Agent Service" "INFO" "No vstsagent* systemd unit found"
+    add_result "AgentRegistration" "Azure DevOps Agent Service" "INFO" "No vsts.agent.* systemd unit found"
 fi
 
 # Jenkins agent/node (jenkins service, or inbound-agent/swarm-client process)
