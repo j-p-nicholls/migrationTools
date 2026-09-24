@@ -95,13 +95,21 @@ Write-Host "=== Build Agent Checks: $hostname [$Phase] ===" -ForegroundColor Cya
 #region 1. Orchestrator / Agent Registration
 Write-Host "`n[1/5] Orchestrator agent registration..." -ForegroundColor Yellow
 
-# Azure DevOps agent (vstsagent) service detection
-$adoAgentSvc = Get-Service -Name 'vstsagent*' -ErrorAction SilentlyContinue
+# Track the account(s) each detected agent service actually runs as, so
+# later checks (config files, credential caches) look in the right
+# profile rather than the interactive tester's own profile.
+$agentServiceAccounts = [System.Collections.Generic.List[string]]::new()
+
+# Use Win32_Service (not Get-Service) because Get-Service does not expose
+# StartName — the account the service logs on as. Build agents are almost
+# always run as a dedicated service account, not the interactive tester.
+$adoAgentSvc = Get-CimInstance Win32_Service -Filter "Name LIKE 'vstsagent%'" -ErrorAction SilentlyContinue
 if ($adoAgentSvc) {
     foreach ($svc in $adoAgentSvc) {
-        $status = if ($svc.Status -eq 'Running') { 'PASS' } else { 'FAIL' }
+        $status = if ($svc.State -eq 'Running') { 'PASS' } else { 'FAIL' }
         Add-Result -Category 'AgentRegistration' -Check "ADO Agent Service: $($svc.Name)" `
-            -Status $status -Detail "Status: $($svc.Status), StartType: $($svc.StartType)"
+            -Status $status -Detail "State: $($svc.State), StartMode: $($svc.StartMode), RunsAs: $($svc.StartName)"
+        if ($svc.StartName) { $agentServiceAccounts.Add($svc.StartName) }
     }
 } else {
     Add-Result -Category 'AgentRegistration' -Check 'Azure DevOps Agent Service' `
@@ -109,12 +117,13 @@ if ($adoAgentSvc) {
 }
 
 # Jenkins agent (jenkinsslave / generic service name patterns)
-$jenkinsSvc = Get-Service -Name '*jenkins*' -ErrorAction SilentlyContinue
+$jenkinsSvc = Get-CimInstance Win32_Service -Filter "Name LIKE '%jenkins%'" -ErrorAction SilentlyContinue
 if ($jenkinsSvc) {
     foreach ($svc in $jenkinsSvc) {
-        $status = if ($svc.Status -eq 'Running') { 'PASS' } else { 'FAIL' }
+        $status = if ($svc.State -eq 'Running') { 'PASS' } else { 'FAIL' }
         Add-Result -Category 'AgentRegistration' -Check "Jenkins Service: $($svc.Name)" `
-            -Status $status -Detail "Status: $($svc.Status), StartType: $($svc.StartType)"
+            -Status $status -Detail "State: $($svc.State), StartMode: $($svc.StartMode), RunsAs: $($svc.StartName)"
+        if ($svc.StartName) { $agentServiceAccounts.Add($svc.StartName) }
     }
 } else {
     Add-Result -Category 'AgentRegistration' -Check 'Jenkins Agent Service' `
@@ -122,11 +131,12 @@ if ($jenkinsSvc) {
 }
 
 # GitLab Runner
-$gitlabSvc = Get-Service -Name 'gitlab-runner' -ErrorAction SilentlyContinue
+$gitlabSvc = Get-CimInstance Win32_Service -Filter "Name = 'gitlab-runner'" -ErrorAction SilentlyContinue
 if ($gitlabSvc) {
-    $status = if ($gitlabSvc.Status -eq 'Running') { 'PASS' } else { 'FAIL' }
+    $status = if ($gitlabSvc.State -eq 'Running') { 'PASS' } else { 'FAIL' }
     Add-Result -Category 'AgentRegistration' -Check 'GitLab Runner Service' `
-        -Status $status -Detail "Status: $($gitlabSvc.Status), StartType: $($gitlabSvc.StartType)"
+        -Status $status -Detail "State: $($gitlabSvc.State), StartMode: $($gitlabSvc.StartMode), RunsAs: $($gitlabSvc.StartName)"
+    if ($gitlabSvc.StartName) { $agentServiceAccounts.Add($gitlabSvc.StartName) }
 
     if (Get-Command gitlab-runner -ErrorAction SilentlyContinue) {
         try {
@@ -146,6 +156,42 @@ if ($gitlabSvc) {
 if (-not $adoAgentSvc -and -not $jenkinsSvc -and -not $gitlabSvc) {
     Add-Result -Category 'AgentRegistration' -Check 'Orchestrator Detection' `
         -Status 'WARN' -Detail 'No known orchestrator agent service (ADO/Jenkins/GitLab) detected — verify manually'
+}
+
+$agentServiceAccounts = $agentServiceAccounts | Select-Object -Unique
+#endregion
+
+#region Helper: resolve a service account's profile directory
+# Built-in accounts (LocalSystem, NETWORK SERVICE, LOCAL SERVICE) don't
+# have a normal C:\Users\<name> profile and are best treated as N/A for
+# per-user config file checks. A real domain/local service account's
+# profile path is looked up via the ProfileList registry key by SID,
+# since it isn't guaranteed to be C:\Users\<samaccountname>.
+function Resolve-ServiceAccountProfile {
+    param([string]$AccountName)
+
+    $builtins = @(
+        'LocalSystem', 'NT AUTHORITY\SYSTEM', 'NT AUTHORITY\NETWORK SERVICE',
+        'NT AUTHORITY\LOCAL SERVICE', 'NT AUTHORITY\NetworkService', 'NT AUTHORITY\LocalService'
+    )
+    if ($builtins -contains $AccountName) {
+        return [pscustomobject]@{ Account = $AccountName; ProfilePath = $null; IsBuiltIn = $true }
+    }
+
+    try {
+        $ntAccount = New-Object System.Security.Principal.NTAccount($AccountName)
+        $sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+        if (Test-Path $profileKey) {
+            $profilePath = (Get-ItemProperty -Path $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
+            return [pscustomobject]@{ Account = $AccountName; ProfilePath = $profilePath; IsBuiltIn = $false }
+        } else {
+            # Account resolves but has never logged on / no local profile registered
+            return [pscustomobject]@{ Account = $AccountName; ProfilePath = $null; IsBuiltIn = $false }
+        }
+    } catch {
+        return [pscustomobject]@{ Account = $AccountName; ProfilePath = $null; IsBuiltIn = $false }
+    }
 }
 #endregion
 
@@ -196,8 +242,15 @@ foreach ($tool in $RequiredTools) {
 #region 3. Environment & PATH Capture
 Write-Host "[3/5] Environment and PATH capture..." -ForegroundColor Yellow
 
+# NOTE: PATH and env vars here reflect the account running THIS script
+# (typically an interactive tester), which may differ from the build
+# agent's service account and from the PATH the agent process actually
+# sees (service processes don't inherit a logon-time PATH the same way).
+Add-Result -Category 'Environment' -Check 'Script Running As' -Status 'INFO' `
+    -Detail "$([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) (interactive/test account — see AgentServiceAccount checks below for the actual agent identity)"
+
 $pathEntries = $env:Path -split ';' | Where-Object { $_ -ne '' }
-Add-Result -Category 'Environment' -Check 'PATH Entry Count' -Status 'INFO' `
+Add-Result -Category 'Environment' -Check 'PATH Entry Count (current session)' -Status 'INFO' `
     -Detail "$($pathEntries.Count) entries" -Data $pathEntries
 
 $relevantEnvVars = Get-ChildItem Env: | Where-Object {
@@ -207,19 +260,58 @@ foreach ($v in $relevantEnvVars) {
     Add-Result -Category 'Environment' -Check "EnvVar: $($v.Name)" -Status 'INFO' -Detail $v.Value
 }
 
-# Package manager config files
-$configChecks = @{
-    'NuGet.Config'   = "$env:APPDATA\NuGet\NuGet.Config"
-    '.npmrc (user)'  = "$env:USERPROFILE\.npmrc"
-    'pip.ini'        = "$env:APPDATA\pip\pip.ini"
-    'Maven settings' = "$env:USERPROFILE\.m2\settings.xml"
-}
-foreach ($name in $configChecks.Keys) {
-    $path = $configChecks[$name]
-    if (Test-Path $path) {
-        Add-Result -Category 'Environment' -Check "Config present: $name" -Status 'PASS' -Detail $path
-    } else {
-        Add-Result -Category 'Environment' -Check "Config present: $name" -Status 'INFO' -Detail "Not found at $path"
+# System-wide (machine-scope) env vars — these ARE what a service process
+# sees regardless of which account it runs as, unlike user-scope vars above.
+$machinePathCount = ([System.Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';' | Where-Object { $_ -ne '' }).Count
+Add-Result -Category 'Environment' -Check 'PATH Entry Count (machine-scope)' -Status 'INFO' `
+    -Detail "$machinePathCount entries — this is what a service process inherits regardless of logon account"
+
+# Package manager config files — checked per detected agent service
+# account, not the interactive tester's own profile, since that's what
+# the agent process actually reads from.
+if ($agentServiceAccounts.Count -eq 0) {
+    Add-Result -Category 'Environment' -Check 'Agent Service Account Config Check' -Status 'WARN' `
+        -Detail 'No agent service account was identified in section 1 — skipping per-account config checks. Config files under your own profile are NOT representative of the agent.'
+} else {
+    foreach ($account in $agentServiceAccounts) {
+        $resolved = Resolve-ServiceAccountProfile -AccountName $account
+
+        if ($resolved.IsBuiltIn) {
+            Add-Result -Category 'Environment' -Check "Agent Service Account: $account" -Status 'INFO' `
+                -Detail 'Built-in account (no per-user profile) — per-user NuGet/npm/Maven config does not apply; check machine-wide config locations (e.g. ProgramData) instead if the toolchain uses them'
+            continue
+        }
+
+        if (-not $resolved.ProfilePath) {
+            Add-Result -Category 'Environment' -Check "Agent Service Account: $account" -Status 'WARN' `
+                -Detail 'Account resolved but has no registered local profile (ProfileList) — it may never have logged on interactively, or config lives elsewhere'
+            continue
+        }
+
+        Add-Result -Category 'Environment' -Check "Agent Service Account: $account" -Status 'PASS' `
+            -Detail "Profile: $($resolved.ProfilePath)"
+
+        $configChecks = @{
+            'NuGet.Config'   = Join-Path $resolved.ProfilePath 'AppData\Roaming\NuGet\NuGet.Config'
+            '.npmrc (user)'  = Join-Path $resolved.ProfilePath '.npmrc'
+            'pip.ini'        = Join-Path $resolved.ProfilePath 'AppData\Roaming\pip\pip.ini'
+            'Maven settings' = Join-Path $resolved.ProfilePath '.m2\settings.xml'
+        }
+        foreach ($name in $configChecks.Keys) {
+            $path = $configChecks[$name]
+            # Reading another account's profile may fail on access rights
+            # even when running as admin over some redirected/DFS profiles.
+            try {
+                if (Test-Path $path) {
+                    Add-Result -Category 'Environment' -Check "[$account] Config present: $name" -Status 'PASS' -Detail $path
+                } else {
+                    Add-Result -Category 'Environment' -Check "[$account] Config present: $name" -Status 'INFO' -Detail "Not found at $path"
+                }
+            } catch {
+                Add-Result -Category 'Environment' -Check "[$account] Config present: $name" -Status 'WARN' `
+                    -Detail "Could not access $path : $($_.Exception.Message)"
+            }
+        }
     }
 }
 #endregion
