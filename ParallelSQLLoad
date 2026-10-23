@@ -1,8 +1,9 @@
 <#
 .SYNOPSIS
     Runs one or more long-running queries across multiple simultaneous connections
-    (threads) and reports connection and query timings per thread. Query output is
-    discarded. No command timeout by default. Works on Windows PowerShell 5.1 and 7+.
+    (threads), optionally repeating them for several iterations, and reports connection
+    and query timings. Query output is discarded. No command timeout by default.
+    Works on Windows PowerShell 5.1 and 7+.
 
 .PARAMETER ThreadCount
     Number of simultaneous connections.
@@ -14,16 +15,31 @@
     One or more .sql files (no GO separators). Combined with -Query; inline queries come first.
 
 .PARAMETER QueryAssignment
-    All        - every thread runs every query, in order, on its own connection (default).
-    RoundRobin - thread N runs only query ((N-1) mod QueryCount)+1, so queries are spread across threads.
+    All        - every thread runs every query, in order (default).
+    RoundRobin - thread N runs only query ((N-1) mod QueryCount)+1, spreading queries across threads.
+
+.PARAMETER Iterations
+    How many times each thread repeats its assigned queries. Threads run their iterations
+    independently (they do not wait for each other between iterations).
+
+.PARAMETER IterationDelaySeconds
+    Pause between iterations, per thread.
+
+.PARAMETER ReconnectEachIteration
+    Open a fresh connection for every iteration. Without it, one connection per thread is
+    reused (and re-opened automatically if it drops).
+
+.PARAMETER CsvPath
+    Write every run (thread, iteration, query, timings, status) to a CSV file.
 
 .EXAMPLE
     .\Invoke-LongQuery-Parallel.ps1 -Server sqlserver01 -Database AppDb -ThreadCount 5 `
-        -Query "SELECT COUNT(*) FROM dbo.BigTable"
+        -Query "SELECT COUNT(*) FROM dbo.BigTable" -Iterations 10 -IterationDelaySeconds 30
 
 .EXAMPLE
     .\Invoke-LongQuery-Parallel.ps1 -Server sqlserver01 -Database AppDb -ThreadCount 6 `
-        -QueryFile .\report1.sql, .\report2.sql, .\report3.sql -QueryAssignment RoundRobin
+        -QueryFile .\report1.sql, .\report2.sql, .\report3.sql -QueryAssignment RoundRobin `
+        -Iterations 3 -ReconnectEachIteration -CsvPath .\results.csv
 #>
 [CmdletBinding()]
 param(
@@ -33,9 +49,13 @@ param(
     [string[]]$QueryFile,
     [ValidateRange(1, 200)][int]$ThreadCount = 1,
     [ValidateSet('All', 'RoundRobin')][string]$QueryAssignment = 'All',
+    [ValidateRange(1, 100000)][int]$Iterations = 1,
+    [int]$IterationDelaySeconds = 0,
+    [switch]$ReconnectEachIteration,
     [int]$QueryTimeoutSeconds = 0,                    # 0 = no timeout
     [int]$ConnectTimeoutSeconds = 15,
     [int]$HeartbeatSeconds = 30,
+    [string]$CsvPath,
     [System.Management.Automation.PSCredential]$Credential,   # omit for Windows integrated auth
     [switch]$MultiSubnetFailover,
     [switch]$TrustServerCertificate
@@ -64,7 +84,7 @@ $sb['Data Source']      = $Server
 $sb['Initial Catalog']  = $Database
 $sb['Connect Timeout']  = $ConnectTimeoutSeconds
 $sb['Application Name'] = 'LongQueryParallel'
-$sb['Pooling']          = $false                 # every thread gets its own genuine connection
+$sb['Pooling']          = $false                 # every connection is a genuine new one
 if ($MultiSubnetFailover)    { $sb['MultiSubnetFailover'] = $true }
 if ($TrustServerCertificate) { $sb['TrustServerCertificate'] = $true }
 if ($Credential) {
@@ -77,77 +97,101 @@ $connString = $sb.ConnectionString
 
 # ---------- Worker (runs in each runspace) ----------
 $worker = {
-    param($Id, $ConnString, $Queries, $QueryTimeout, $Log, $Barrier, $BarrierWaitMs)
+    param($Id, $ConnString, $Queries, $QueryTimeout, $Log, $Barrier, $BarrierWaitMs, $Iterations, $DelaySec, $Reconnect)
 
-    function Write-Log($text, $color) {
+    function Write-Log($text, $color, $iter) {
+        $tag = if ($Iterations -gt 1 -and $iter) { " i$iter" } else { '' }
         $Log.Enqueue([pscustomobject]@{
-            Text  = ("[{0}] T{1,-3} {2}" -f (Get-Date -Format 'HH:mm:ss.fff'), $Id, $text)
+            Text  = ("[{0}] T{1}{2} {3}" -f (Get-Date -Format 'HH:mm:ss.fff'), $Id, $tag, $text)
             Color = $color
         })
     }
 
-    $result = [pscustomobject]@{
-        ThreadId     = $Id
-        ConnectMs    = $null
-        ConnectError = $null
-        Queries      = New-Object System.Collections.ArrayList
-    }
-    $conn = New-Object System.Data.SqlClient.SqlConnection $ConnString
-
-    try {
-        # Connect
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    # Opens a connection, records the timing, returns the connection or $null on failure
+    function Connect-Db($iter) {
+        $c   = New-Object System.Data.SqlClient.SqlConnection $ConnString
+        $rec = [pscustomobject]@{ Iteration = $iter; Ms = $null; Error = $null }
+        [void]$result.Connects.Add($rec)
+        $csw = [System.Diagnostics.Stopwatch]::StartNew()
         try {
-            $conn.Open()
-            $result.ConnectMs = $sw.Elapsed.TotalMilliseconds
-            Write-Log ("connected in {0:N1} ms" -f $result.ConnectMs) 'Green'
+            $c.Open()
+            $rec.Ms = $csw.Elapsed.TotalMilliseconds
+            Write-Log ("connected in {0:N1} ms" -f $rec.Ms) 'Green' $iter
+            return $c
         }
         catch {
-            $result.ConnectError = $_.Exception.GetBaseException().Message -replace '\s+', ' '
-            Write-Log ("CONNECT FAILED: {0}" -f $result.ConnectError) 'Red'
+            $rec.Error = $_.Exception.GetBaseException().Message -replace '\s+', ' '
+            Write-Log ("CONNECT FAILED: {0}" -f $rec.Error) 'Red' $iter
+            $c.Dispose()
+            return $null
         }
-        finally {
-            [void]$Barrier.Signal()          # signal even on failure so other threads aren't held up
-        }
+    }
 
-        # Wait until every thread has attempted to connect, so queries start together
-        [void]$Barrier.Wait($BarrierWaitMs)
+    $result = [pscustomobject]@{
+        ThreadId = $Id
+        Connects = (New-Object System.Collections.ArrayList)
+        Queries  = (New-Object System.Collections.ArrayList)
+    }
+    $conn      = $null
+    $signalled = $false
 
-        if ($null -ne $result.ConnectMs) {
+    try {
+        for ($iter = 1; $iter -le $Iterations; $iter++) {
+            if ($iter -gt 1 -and $DelaySec -gt 0) { Start-Sleep -Seconds $DelaySec }
+
+            # (Re)connect when asked to, or when there is no usable connection
+            if ($Reconnect -or $null -eq $conn -or $conn.State -ne 'Open') {
+                if ($null -ne $conn) { $conn.Dispose(); $conn = $null }
+                $conn = Connect-Db $iter
+            }
+
+            # After the first connect attempt, wait for every thread so queries start together
+            if (-not $signalled) {
+                $signalled = $true
+                [void]$Barrier.Signal()
+                [void]$Barrier.Wait($BarrierWaitMs)
+            }
+
+            if ($null -eq $conn) { continue }
+
             foreach ($q in @($Queries)) {
-                $qr = [pscustomobject]@{ Label = $q.Label; Ms = $null; Rows = $null; Status = 'SKIPPED'; Error = $null }
+                $qr = [pscustomobject]@{
+                    Iteration = $iter; Label = $q.Label; StartedAt = $null
+                    Ms = $null; Rows = $null; Status = 'SKIPPED'; Error = $null
+                }
                 [void]$result.Queries.Add($qr)
 
                 if ($conn.State -ne 'Open') {
                     $qr.Error = 'Connection no longer open'
-                    Write-Log ("{0} skipped (connection no longer open)" -f $q.Label) 'Yellow'
+                    Write-Log ("{0} skipped (connection no longer open)" -f $q.Label) 'Yellow' $iter
                     continue
                 }
 
-                Write-Log ("{0} started" -f $q.Label) 'Gray'
+                Write-Log ("{0} started" -f $q.Label) 'Gray' $iter
+                $qr.StartedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                 $cmd = $conn.CreateCommand()
                 $cmd.CommandText    = $q.Text
                 $cmd.CommandTimeout = $QueryTimeout
-                $sw.Restart()
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
                 try {
                     $qr.Rows   = $cmd.ExecuteNonQuery()
                     $qr.Ms     = $sw.Elapsed.TotalMilliseconds
                     $qr.Status = 'OK'
-                    Write-Log ("{0} finished in {1:N1} s" -f $q.Label, ($qr.Ms / 1000)) 'Green'
+                    Write-Log ("{0} finished in {1:N1} s" -f $q.Label, ($qr.Ms / 1000)) 'Green' $iter
                 }
                 catch {
                     $qr.Ms     = $sw.Elapsed.TotalMilliseconds
                     $qr.Status = 'FAILED'
                     $qr.Error  = $_.Exception.GetBaseException().Message -replace '\s+', ' '
-                    Write-Log ("{0} FAILED after {1:N1} s: {2}" -f $q.Label, ($qr.Ms / 1000), $qr.Error) 'Red'
+                    Write-Log ("{0} FAILED after {1:N1} s: {2}" -f $q.Label, ($qr.Ms / 1000), $qr.Error) 'Red' $iter
                 }
                 finally { $cmd.Dispose() }
             }
         }
     }
     finally {
-        if ($conn.State -ne 'Closed') { $conn.Close() }
-        $conn.Dispose()
+        if ($null -ne $conn) { $conn.Dispose() }
+        if (-not $signalled) { try { [void]$Barrier.Signal() } catch { } }   # never leave other threads waiting
     }
     $result
 }
@@ -156,6 +200,12 @@ $worker = {
 Write-Host "Server      : $Server" -ForegroundColor Cyan
 Write-Host "Database    : $Database" -ForegroundColor Cyan
 Write-Host "Threads     : $ThreadCount ($QueryAssignment assignment)" -ForegroundColor Cyan
+$iterText = "$Iterations"
+if ($Iterations -gt 1) {
+    if ($IterationDelaySeconds -gt 0) { $iterText += ", $IterationDelaySeconds s delay between" }
+    $iterText += $(if ($ReconnectEachIteration) { ', new connection each iteration' } else { ', connection reused' })
+}
+Write-Host "Iterations  : $iterText" -ForegroundColor Cyan
 Write-Host ("Timeout     : {0}" -f $(if ($QueryTimeoutSeconds -eq 0) { 'none' } else { "$QueryTimeoutSeconds s" })) -ForegroundColor Cyan
 Write-Host "Queries     :" -ForegroundColor Cyan
 foreach ($q in $queryList) {
@@ -166,13 +216,13 @@ foreach ($q in $queryList) {
 Write-Host "Started     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n"
 
 # ---------- Launch threads ----------
-$log      = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
-$barrier  = New-Object System.Threading.CountdownEvent $ThreadCount
+$log           = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+$barrier       = New-Object System.Threading.CountdownEvent $ThreadCount
 $barrierWaitMs = ($ConnectTimeoutSeconds + 30) * 1000
-$pool     = [runspacefactory]::CreateRunspacePool(1, $ThreadCount)
+$pool          = [runspacefactory]::CreateRunspacePool(1, $ThreadCount)
 $pool.Open()
-$jobs     = New-Object System.Collections.Generic.List[object]
-$wallClock = [System.Diagnostics.Stopwatch]::StartNew()
+$jobs          = New-Object System.Collections.Generic.List[object]
+$wallClock     = [System.Diagnostics.Stopwatch]::StartNew()
 
 function Show-Log {
     $item = $null
@@ -181,16 +231,24 @@ function Show-Log {
 
 try {
     foreach ($i in 1..$ThreadCount) {
-        $assigned = if ($QueryAssignment -eq 'RoundRobin') {
-            , @($queryList[($i - 1) % $queryList.Count])
+        if ($QueryAssignment -eq 'RoundRobin') {
+            $assigned = @($queryList[($i - 1) % $queryList.Count])
         } else {
-            , @($queryList.ToArray())
+            $assigned = @($queryList.ToArray())
         }
         $ps = [powershell]::Create()
         $ps.RunspacePool = $pool
-        [void]$ps.AddScript($worker).
-            AddArgument($i).AddArgument($connString).AddArgument($assigned[0]).
-            AddArgument($QueryTimeoutSeconds).AddArgument($log).AddArgument($barrier).AddArgument($barrierWaitMs)
+        [void]$ps.AddScript($worker)
+        [void]$ps.AddArgument($i)
+        [void]$ps.AddArgument($connString)
+        [void]$ps.AddArgument($assigned)
+        [void]$ps.AddArgument($QueryTimeoutSeconds)
+        [void]$ps.AddArgument($log)
+        [void]$ps.AddArgument($barrier)
+        [void]$ps.AddArgument($barrierWaitMs)
+        [void]$ps.AddArgument($Iterations)
+        [void]$ps.AddArgument($IterationDelaySeconds)
+        [void]$ps.AddArgument([bool]$ReconnectEachIteration)
         $jobs.Add([pscustomobject]@{ Id = $i; PS = $ps; Handle = $ps.BeginInvoke() })
     }
 
@@ -200,7 +258,7 @@ try {
         Show-Log
         if ($lastBeat.Elapsed.TotalSeconds -ge $HeartbeatSeconds) {
             $running = @($jobs | Where-Object { -not $_.Handle.IsCompleted }).Count
-            Write-Host ("  ...{0} of {1} threads still running ({2:mm\:ss} elapsed)" -f $running, $ThreadCount, $wallClock.Elapsed) -ForegroundColor DarkGray
+            Write-Host ("  ...{0} of {1} threads still running ({2:hh\:mm\:ss} elapsed)" -f $running, $ThreadCount, $wallClock.Elapsed) -ForegroundColor DarkGray
             $lastBeat.Restart()
         }
         Start-Sleep -Milliseconds 250
@@ -221,36 +279,68 @@ finally {
     $barrier.Dispose()
 }
 
-# ---------- Report ----------
-$rows = foreach ($r in ($results | Sort-Object ThreadId)) {
-    $connText = if ($null -ne $r.ConnectMs) { '{0:N1}' -f $r.ConnectMs } else { 'FAILED' }
-    if ($r.Queries.Count -eq 0) {
-        [pscustomobject]@{ Thread = $r.ThreadId; 'Connect (ms)' = $connText; Query = '-'; 'Query time' = '-'; Status = 'NO CONNECTION'; Error = $r.ConnectError }
-    }
-    foreach ($qr in $r.Queries) {
-        $t = if ($null -ne $qr.Ms) { '{0:hh\:mm\:ss\.f}' -f [timespan]::FromMilliseconds($qr.Ms) } else { '-' }
-        [pscustomobject]@{ Thread = $r.ThreadId; 'Connect (ms)' = $connText; Query = $qr.Label; 'Query time' = $t; Status = $qr.Status; Error = $qr.Error }
+# ---------- Build report rows ----------
+$rows = New-Object System.Collections.Generic.List[object]
+$flat = New-Object System.Collections.Generic.List[object]
+
+foreach ($r in ($results | Sort-Object ThreadId)) {
+    foreach ($iter in 1..$Iterations) {
+        $c  = @($r.Connects | Where-Object { $_.Iteration -eq $iter }) | Select-Object -First 1
+        $connText = if ($c) { if ($null -ne $c.Ms) { '{0:N1}' -f $c.Ms } else { 'FAILED' } } else { 'reused' }
+        $qs = @($r.Queries | Where-Object { $_.Iteration -eq $iter })
+
+        if ($qs.Count -eq 0) {
+            $rows.Add([pscustomobject]@{ Thread = $r.ThreadId; Iter = $iter; 'Connect (ms)' = $connText; Query = '-'; 'Query time' = '-'; Status = 'NO CONNECTION'; Error = $(if ($c) { $c.Error }) })
+            $flat.Add([pscustomobject]@{ Thread = $r.ThreadId; Iteration = $iter; Query = $null; StartedAt = $null; ConnectMs = $(if ($c) { $c.Ms }); QueryMs = $null; Rows = $null; Status = 'NO CONNECTION'; Error = $(if ($c) { $c.Error }) })
+        }
+        foreach ($qr in $qs) {
+            $t = if ($null -ne $qr.Ms) { '{0:hh\:mm\:ss\.f}' -f [timespan]::FromMilliseconds($qr.Ms) } else { '-' }
+            $rows.Add([pscustomobject]@{ Thread = $r.ThreadId; Iter = $iter; 'Connect (ms)' = $connText; Query = $qr.Label; 'Query time' = $t; Status = $qr.Status; Error = $qr.Error })
+            $flat.Add([pscustomobject]@{
+                Thread = $r.ThreadId; Iteration = $iter; Query = $qr.Label; StartedAt = $qr.StartedAt
+                ConnectMs = $(if ($c) { $c.Ms }); QueryMs = $(if ($null -ne $qr.Ms) { [math]::Round($qr.Ms, 1) })
+                Rows = $qr.Rows; Status = $qr.Status; Error = $qr.Error
+            })
+        }
     }
 }
 
+# ---------- Report ----------
 Write-Host "`n=========== RESULTS ===========" -ForegroundColor Cyan
-$rows | Format-Table Thread, 'Connect (ms)', Query, 'Query time', Status, Error -AutoSize | Out-Host
+if ($rows.Count -le 60) {
+    $show = $rows
+} else {
+    Write-Host ("({0} rows - showing non-OK rows only; use -CsvPath for full detail)" -f $rows.Count) -ForegroundColor DarkGray
+    $show = @($rows | Where-Object { $_.Status -ne 'OK' })
+}
+if (@($show).Count) {
+    $show | Format-Table Thread, Iter, 'Connect (ms)', Query, 'Query time', Status, Error -AutoSize | Out-Host
+}
 
-# Aggregates per query (successful runs only)
+# Per-query timing across every thread and iteration (successful runs only)
 $allQ = foreach ($r in $results) { foreach ($qr in $r.Queries) { $qr } }
 $okQ  = @($allQ | Where-Object { $_.Status -eq 'OK' })
 if ($okQ.Count) {
-    Write-Host "Per-query timing across threads (successful runs):" -ForegroundColor Cyan
+    Write-Host "Per-query timing across all threads and iterations (successful runs):" -ForegroundColor Cyan
     foreach ($g in ($okQ | Group-Object Label | Sort-Object Name)) {
         $m = $g.Group.Ms | Measure-Object -Average -Minimum -Maximum
         Write-Host ("  {0}: {1} run(s)  min {2:N1} s  avg {3:N1} s  max {4:N1} s" -f $g.Name, $g.Count, ($m.Minimum / 1000), ($m.Average / 1000), ($m.Maximum / 1000))
     }
 }
 
-$connOk = @($results | Where-Object { $null -ne $_.ConnectMs })
-if ($connOk.Count) {
-    $c = $connOk.ConnectMs | Measure-Object -Average -Minimum -Maximum
-    Write-Host ("`nConnection time ({0} of {1} connected): min {2:N1} ms  avg {3:N1} ms  max {4:N1} ms" -f $connOk.Count, $ThreadCount, $c.Minimum, $c.Average, $c.Maximum)
+$allC  = @($results | ForEach-Object { $_.Connects } | ForEach-Object { $_ })
+$connOk = @($allC | Where-Object { $null -ne $_.Ms })
+if ($allC.Count) {
+    Write-Host ("`nConnections: {0} of {1} attempts succeeded" -f $connOk.Count, $allC.Count)
+    if ($connOk.Count) {
+        $c = $connOk.Ms | Measure-Object -Average -Minimum -Maximum
+        Write-Host ("Connection time: min {0:N1} ms  avg {1:N1} ms  max {2:N1} ms" -f $c.Minimum, $c.Average, $c.Maximum)
+    }
+}
+
+if ($CsvPath) {
+    $flat | Export-Csv -Path $CsvPath -NoTypeInformation
+    Write-Host "Detailed results written to $CsvPath"
 }
 
 $failed = @($rows | Where-Object { $_.Status -in 'FAILED', 'NO CONNECTION' }).Count
